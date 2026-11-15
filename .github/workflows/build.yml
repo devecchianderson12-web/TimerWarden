@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# build.ps1 lee estos valores: compilar.bat usa este mismo archivo en local.
+env:
+  APP_NAME: AppWarden
+  OUTPUT_DIR: dist
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compilar
+        shell: powershell
+        run: .\build.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}
+          path: ${{ env.OUTPUT_DIR }}/${{ env.APP_NAME }}.exe
+      # Recrea el release "latest" con el nombre AppWarden V<n>. El cuerpo lleva ese número de versión:
+      # la app solo avisa cuando el release tiene un número MAYOR que el suyo (nunca "porque sí").
+      - name: Actualizar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes --cleanup-tag 2>$null
+          Copy-Item "${env:OUTPUT_DIR}/${env:APP_NAME}.exe" "${env:OUTPUT_DIR}/AppWardenV${{ github.run_number }}.exe"
+          gh release create latest "${env:OUTPUT_DIR}/AppWardenV${{ github.run_number }}.exe" --title "AppWarden V${{ github.run_number }}" --notes "${{ github.run_number }}" --target "${{ github.sha }}"
