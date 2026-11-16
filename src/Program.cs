@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Drawing;
 using System.Linq;
 using System.Media;
@@ -43,9 +44,34 @@ namespace CandadoApp
 
                 Application.EnableVisualStyles();
                 Application.SetCompatibleTextRenderingDefault(false);
-                bool openConfig = !args.Contains(BackgroundArgument) && !args.Contains(UpdateRestartArgument);
+                bool openConfig = !args.Contains(BackgroundArgument) && !args.Contains(UpdateRestartArgument) && !JustLoggedOn();
                 Application.Run(new TrayApp(openSignal, openConfig));
             }
+        }
+
+        // Al iniciar Windows arranca solo en la bandeja aunque el acceso de inicio no traiga --background
+        // (acceso en la carpeta Inicio, entrada vieja del registro, Programador de tareas...).
+        private static bool JustLoggedOn()
+        {
+            try
+            {
+                int session = Process.GetCurrentProcess().SessionId;
+                DateTime? first = null;
+                foreach (Process p in Process.GetProcessesByName("explorer"))
+                {
+                    using (p)
+                    {
+                        try
+                        {
+                            if (p.SessionId == session && (first == null || p.StartTime < first.Value))
+                                first = p.StartTime;
+                        }
+                        catch { }
+                    }
+                }
+                return first.HasValue && DateTime.Now - first.Value < TimeSpan.FromMinutes(2);
+            }
+            catch { return false; }
         }
     }
 

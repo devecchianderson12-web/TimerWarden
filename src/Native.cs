@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Runtime.InteropServices;
 
@@ -174,10 +175,162 @@ namespace CandadoApp
 
         // Congela o reanuda todos los hilos de un proceso (la app bloqueada queda en pausa tras la ventana).
         [DllImport("ntdll.dll")]
-        public static extern int NtSuspendProcess(IntPtr handle);
+        private static extern int NtSuspendProcess(IntPtr handle);
 
         [DllImport("ntdll.dll")]
-        public static extern int NtResumeProcess(IntPtr handle);
+        private static extern int NtResumeProcess(IntPtr handle);
+
+        private const uint PROCESS_TERMINATE = 0x0001;
+        private const uint PROCESS_SUSPEND_RESUME = 0x0800;
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, int processId);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool TerminateProcess(IntPtr handle, uint exitCode);
+
+        // Se pide solo el permiso necesario: Process.Handle pide acceso total y falla con muchos juegos y launchers.
+        public static bool Suspend(int pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+            if (h == IntPtr.Zero)
+                return false;
+            try { return NtSuspendProcess(h) == 0; }
+            finally { CloseHandle(h); }
+        }
+
+        public static void Resume(int pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
+            if (h == IntPtr.Zero)
+                return;
+            try { NtResumeProcess(h); }
+            finally { CloseHandle(h); }
+        }
+
+        public static void Kill(int pid)
+        {
+            IntPtr h = OpenProcess(PROCESS_TERMINATE, false, pid);
+            if (h == IntPtr.Zero)
+                return;
+            try { TerminateProcess(h, 1); }
+            finally { CloseHandle(h); }
+        }
+
+        // ---------- Lista de procesos (una sola foto, con el .exe y el proceso padre) ----------
+
+        public struct ProcessInfo
+        {
+            public uint Id;
+            public uint ParentId;
+            public string ExeFile; // en minúsculas, con .exe
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        private const uint TH32CS_SNAPPROCESS = 0x00000002;
+        private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32FirstW")]
+        private static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "Process32NextW")]
+        private static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+        public static List<ProcessInfo> Snapshot()
+        {
+            List<ProcessInfo> list = new List<ProcessInfo>();
+            IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (snapshot == INVALID_HANDLE_VALUE || snapshot == IntPtr.Zero)
+                return list;
+            try
+            {
+                PROCESSENTRY32 entry = new PROCESSENTRY32();
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (!Process32First(snapshot, ref entry))
+                    return list;
+                do
+                {
+                    list.Add(new ProcessInfo
+                    {
+                        Id = entry.th32ProcessID,
+                        ParentId = entry.th32ParentProcessID,
+                        ExeFile = (entry.szExeFile ?? "").ToLowerInvariant()
+                    });
+                }
+                while (Process32Next(snapshot, ref entry));
+            }
+            finally { CloseHandle(snapshot); }
+            return list;
+        }
+
+        // ---------- Ventanas visibles ----------
+
+        private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowTextLength(IntPtr hwnd);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);
+
+        private const uint GW_OWNER = 4;
+        private const int DWMWA_CLOAKED = 14;
+
+        // Procesos que tienen al menos una ventana principal a la vista (minimizada también cuenta).
+        public static HashSet<uint> PidsWithVisibleWindow()
+        {
+            HashSet<uint> pids = new HashSet<uint>();
+            EnumWindows(delegate(IntPtr hwnd, IntPtr lParam)
+            {
+                if (!IsWindowVisible(hwnd) || GetWindow(hwnd, GW_OWNER) != IntPtr.Zero || GetWindowTextLength(hwnd) == 0)
+                    return true;
+                if ((GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64() & WS_EX_TOOLWINDOW) != 0)
+                    return true;
+                int cloaked;
+                try
+                {
+                    if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out cloaked, sizeof(int)) == 0 && cloaked != 0)
+                        return true;
+                }
+                catch (DllNotFoundException) { }
+                uint pid;
+                GetWindowThreadProcessId(hwnd, out pid);
+                if (pid != 0)
+                    pids.Add(pid);
+                return true;
+            }, IntPtr.Zero);
+            return pids;
+        }
 
         public static float DpiScaleAt(Point point)
         {

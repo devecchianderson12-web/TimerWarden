@@ -11,20 +11,32 @@ namespace CandadoApp
 {
     internal struct BlockedHit
     {
-        public int Pid;
         public string Name;
         public string FileName;
-        public string Path;
-        public bool Suspended;
     }
 
-    // Revisa periódicamente los procesos y detiene los que están en la lista hasta que se escriba la contraseña.
+    // Revisa periódicamente los procesos y congela las apps de la lista hasta que se escriba la contraseña.
+    // El estado se lleva por app (.exe), no por proceso: una app desbloqueada que se cierra pero sigue viva en
+    // segundo plano (Steam, Discord, Epic...) vuelve a pedir la contraseña cuando se abre otra ventana suya.
     internal sealed class Watcher
     {
+        private enum State { Pending, Authorized, Dormant }
+
+        private sealed class Family
+        {
+            public State State;
+            public int Since;       // momento del desbloqueo (Environment.TickCount)
+            public int LastWindow;  // última vez que se vio una ventana suya
+            public bool HadWindow;
+        }
+
+        private const int ClosedGraceMs = 3000;    // sin ventanas este tiempo = la app se cerró
+        private const int NoWindowGraceMs = 20000; // desbloqueada pero nunca mostró ventana
+
         private readonly Settings settings;
-        private readonly HashSet<int> authorized = new HashSet<int>();
-        private readonly HashSet<int> pending = new HashSet<int>();
-        private readonly int selfPid = Process.GetCurrentProcess().Id;
+        private readonly Dictionary<string, Family> families = new Dictionary<string, Family>();
+        private readonly Dictionary<int, string> suspended = new Dictionary<int, string>(); // pid -> app
+        private readonly uint selfPid = (uint)Process.GetCurrentProcess().Id;
 
         public Watcher(Settings settings)
         {
@@ -41,35 +53,64 @@ namespace CandadoApp
             if (names.Count == 0)
                 return hits;
 
-            Process[] all = Process.GetProcesses();
-            try
+            List<Native.ProcessInfo> all = Native.Snapshot();
+            Dictionary<string, List<int>> running = new Dictionary<string, List<int>>();
+            foreach (Native.ProcessInfo p in all)
             {
-                HashSet<int> alive = new HashSet<int>(all.Select(p => SafeId(p)));
-                authorized.RemoveWhere(id => !alive.Contains(id));
-                pending.RemoveWhere(id => !alive.Contains(id));
-
-                foreach (Process p in all)
-                {
-                    int pid = SafeId(p);
-                    if (pid <= 0 || pid == selfPid || authorized.Contains(pid) || pending.Contains(pid))
-                        continue;
-
-                    string name;
-                    try { name = (p.ProcessName + ".exe").ToLowerInvariant(); }
-                    catch { continue; }
-                    if (!names.Contains(name))
-                        continue;
-
-                    string path = TryPath(p);
-                    bool suspended = TrySuspend(p);
-                    pending.Add(pid);
-                    hits.Add(new BlockedHit { Pid = pid, Name = DisplayName(name), FileName = name, Path = path, Suspended = suspended });
-                }
+                if (p.Id == 0 || p.Id == selfPid || !names.Contains(p.ExeFile))
+                    continue;
+                List<int> list;
+                if (!running.TryGetValue(p.ExeFile, out list))
+                    running[p.ExeFile] = list = new List<int>();
+                list.Add((int)p.Id);
             }
-            finally
+
+            // Se olvidan los procesos y apps que ya no corren (salvo la que tiene la pantalla de bloqueo abierta).
+            HashSet<int> alive = new HashSet<int>(running.Values.SelectMany(l => l));
+            foreach (int pid in suspended.Keys.Where(id => !alive.Contains(id)).ToList())
+                suspended.Remove(pid);
+            foreach (string gone in families.Keys.Where(k => !running.ContainsKey(k) && families[k].State != State.Pending).ToList())
+                families.Remove(gone);
+
+            HashSet<int> windowed = null;
+            int now = Environment.TickCount;
+            foreach (KeyValuePair<string, List<int>> entry in running)
             {
-                foreach (Process p in all)
-                    p.Dispose();
+                Family family;
+                families.TryGetValue(entry.Key, out family);
+
+                if (family != null && family.State != State.Pending)
+                {
+                    if (windowed == null)
+                        windowed = PidsWithWindow(all);
+                    bool hasWindow = entry.Value.Any(windowed.Contains);
+
+                    if (family.State == State.Authorized)
+                    {
+                        if (hasWindow)
+                        {
+                            family.HadWindow = true;
+                            family.LastWindow = now;
+                        }
+                        else if (family.HadWindow ? now - family.LastWindow > ClosedGraceMs : now - family.Since > NoWindowGraceMs)
+                        {
+                            family.State = State.Dormant;
+                        }
+                        continue;
+                    }
+                    if (!hasWindow)
+                        continue; // sigue en segundo plano: se bloquea recién cuando vuelva a mostrar una ventana
+                }
+
+                // App nueva o reabierta: se congelan todos sus procesos (también los que aparezcan mientras espera).
+                foreach (int pid in entry.Value)
+                    Suspend(pid, entry.Key);
+
+                if (family == null || family.State != State.Pending)
+                {
+                    families[entry.Key] = new Family { State = State.Pending };
+                    hits.Add(new BlockedHit { Name = DisplayName(entry.Key), FileName = entry.Key });
+                }
             }
             return hits;
         }
@@ -77,36 +118,58 @@ namespace CandadoApp
         // Una app puede tener varios procesos con el mismo .exe: un desbloqueo (o un cierre) los cubre a todos.
         public void AuthorizeFamily(string fileName)
         {
-            ForEachOfFamily(fileName, (p, id) =>
+            families[fileName] = new Family { State = State.Authorized, Since = Environment.TickCount };
+            foreach (int pid in suspended.Where(s => s.Value == fileName).Select(s => s.Key).ToList())
             {
-                authorized.Add(id);
-                pending.Remove(id);
-                try { Native.NtResumeProcess(p.Handle); } catch { }
-            });
+                Native.Resume(pid);
+                suspended.Remove(pid);
+            }
         }
 
         public void KillFamily(string fileName)
         {
-            ForEachOfFamily(fileName, (p, id) =>
+            families.Remove(fileName);
+            foreach (Native.ProcessInfo p in Native.Snapshot())
             {
-                pending.Remove(id);
-                try { Native.NtResumeProcess(p.Handle); p.Kill(); } catch { }
-            });
+                if (p.Id == 0 || p.Id == selfPid || p.ExeFile != fileName)
+                    continue;
+                int pid = (int)p.Id;
+                if (suspended.Remove(pid))
+                    Native.Resume(pid);
+                Native.Kill(pid);
+            }
+            foreach (int pid in suspended.Where(s => s.Value == fileName).Select(s => s.Key).ToList())
+                suspended.Remove(pid);
         }
 
-        private void ForEachOfFamily(string fileName, Action<Process, int> action)
+        private void Suspend(int pid, string fileName)
         {
-            foreach (Process p in Process.GetProcesses())
+            if (!suspended.ContainsKey(pid) && Native.Suspend(pid))
+                suspended[pid] = fileName;
+        }
+
+        // Procesos con una ventana principal visible, más sus padres y abuelos: hay apps cuya ventana la dibuja
+        // un proceso hijo con otro nombre (p. ej. Steam con steamwebhelper.exe).
+        private static HashSet<int> PidsWithWindow(List<Native.ProcessInfo> all)
+        {
+            Dictionary<uint, uint> parent = new Dictionary<uint, uint>();
+            foreach (Native.ProcessInfo p in all)
+                parent[p.Id] = p.ParentId;
+
+            HashSet<int> result = new HashSet<int>();
+            foreach (uint pid in Native.PidsWithVisibleWindow())
             {
-                try
+                uint current = pid;
+                for (int level = 0; level < 3 && current != 0; level++)
                 {
-                    int id = SafeId(p);
-                    if (id > 0 && id != selfPid && (p.ProcessName + ".exe").ToLowerInvariant() == fileName)
-                        action(p, id);
+                    result.Add((int)current);
+                    uint next;
+                    if (!parent.TryGetValue(current, out next) || next == current)
+                        break;
+                    current = next;
                 }
-                catch { }
-                finally { p.Dispose(); }
             }
+            return result;
         }
 
         private string DisplayName(string fileName)
@@ -115,22 +178,10 @@ namespace CandadoApp
             return app != null ? app.Name : fileName;
         }
 
-        private static int SafeId(Process p)
-        {
-            try { return p.Id; }
-            catch { return -1; }
-        }
-
         private static string TryPath(Process p)
         {
             try { return p.MainModule.FileName; }
             catch { return ""; }
-        }
-
-        private static bool TrySuspend(Process p)
-        {
-            try { return Native.NtSuspendProcess(p.Handle) == 0; }
-            catch { return false; }
         }
 
         // Procesos con ventana visible.
